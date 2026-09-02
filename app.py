@@ -51,32 +51,55 @@ THAI_MONTHS = [
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+CELESTRAK_HOSTS = ["https://celestrak.org", "https://celestrak.com"]
+
+
 @st.cache_data(ttl=3600)
 def fetch_tle_candidates(query: str):
-    """ดึงค่า TLE จาก CelesTrak API — คืนเป็น list เพราะการค้นหาบางชื่ออาจได้หลายดวง"""
-    url = f"https://celestrak.org/NORAD/elements/gp.php?NAME={query}&FORMAT=tle"
-    try:
-        response = requests.get(url, timeout=10)
-    except Exception as e:
-        return [], f"เชื่อมต่อ CelesTrak ไม่สำเร็จ: {e}"
+    """ดึงค่า TLE จาก CelesTrak API — คืนเป็น list เพราะการค้นหาบางชื่ออาจได้หลายดวง
 
-    if response.status_code != 200:
-        return [], f"CelesTrak ตอบกลับสถานะ HTTP {response.status_code}"
+    หมายเหตุสำคัญ: ฟังก์ชันนี้ต้อง 'raise Exception' เมื่อดึงข้อมูลไม่สำเร็จ (ไม่ return
+    error กลับไปแบบปกติ) เพราะ @st.cache_data ของ Streamlit จะไม่ cache ผลลัพธ์ตอนที่ฟังก์ชัน
+    raise exception ออกมา — ถ้า return ค่า error เป็น tuple ตามปกติ Streamlit จะเก็บ (cache)
+    ผลลัพธ์ error นั้นไว้เต็ม ttl (1 ชม.) ทำให้ต่อให้เน็ต/CelesTrak กลับมาใช้ได้แล้ว ผู้ใช้ก็ยัง
+    เจอ error เดิมค้างอยู่จนครบชั่วโมง อันนี้แก้บั๊กเดิมด้วย
 
-    lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
-    if len(lines) < 3:
-        return [], "ไม่พบข้อมูลดาวเทียมที่ตรงกับคำค้นหา"
+    ลอง celestrak.org ก่อน ถ้าไทม์เอาต์/ต่อไม่ติดค่อย fallback ไป celestrak.com (mirror เดิม)
+    และลองซ้ำ host ละ 2 ครั้ง กันปัญหาการเชื่อมต่อสะดุดแว้บเดียว
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SatelliteCommandDelayCalc/1.0)"}
+    last_error = None
 
-    candidates = []
-    for i in range(0, len(lines) - 2, 3):
-        name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
-        if l1.startswith("1 ") and l2.startswith("2 "):
-            candidates.append((name, l1, l2))
+    for host in CELESTRAK_HOSTS:
+        url = f"{host}/NORAD/elements/gp.php?NAME={query}&FORMAT=tle"
+        for attempt in range(2):
+            try:
+                response = requests.get(url, headers=headers, timeout=15)
+            except Exception as e:
+                last_error = f"เชื่อมต่อ {host} ไม่สำเร็จ: {e}"
+                continue
 
-    if not candidates:
-        return [], "รูปแบบข้อมูลที่ได้รับไม่ถูกต้อง (ไม่พบบรรทัด TLE ที่สมบูรณ์)"
+            if response.status_code != 200:
+                last_error = f"{host} ตอบกลับสถานะ HTTP {response.status_code}"
+                continue
 
-    return candidates, None
+            lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
+            if len(lines) < 3:
+                raise ValueError("ไม่พบข้อมูลดาวเทียมที่ตรงกับคำค้นหา")
+
+            candidates = []
+            for i in range(0, len(lines) - 2, 3):
+                name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
+                if l1.startswith("1 ") and l2.startswith("2 "):
+                    candidates.append((name, l1, l2))
+
+            if not candidates:
+                raise ValueError("รูปแบบข้อมูลที่ได้รับไม่ถูกต้อง (ไม่พบบรรทัด TLE ที่สมบูรณ์)")
+
+            return candidates, None
+
+    raise ConnectionError(last_error or "เชื่อมต่อ CelesTrak ไม่สำเร็จ (ไม่ทราบสาเหตุ)")
+
 
 
 def validate_tle(line1: str, line2: str):
@@ -354,10 +377,23 @@ if tle_source == "CelesTrak API (สด)":
     sat_search = st.sidebar.text_input("ค้นหาชื่อดาวเทียม (เช่น ISS, NOAA 19, THAICOM 8):", value="ISS")
     with st.sidebar:
         with st.spinner("กำลังดึงข้อมูล TLE..."):
-            candidates, err = fetch_tle_candidates(sat_search) if sat_search.strip() else ([], "กรุณาระบุชื่อดาวเทียม")
+            candidates, err = [], None
+            if not sat_search.strip():
+                err = "กรุณาระบุชื่อดาวเทียม"
+            else:
+                try:
+                    candidates, err = fetch_tle_candidates(sat_search)
+                except Exception as e:
+                    candidates, err = [], str(e)
 
         if err:
             st.error(f"❌ {err}")
+            st.caption(
+                "💡 ถ้า CelesTrak เชื่อมต่อไม่ได้อยู่บ่อย ๆ (เช่น เซิร์ฟเวอร์ที่ deploy โดนบล็อกหรือ "
+                "เน็ตองค์กรกรอง) ให้สลับไปแท็บ 'ป้อน TLE เอง (Custom)' ด้านบนแล้ววาง TLE ที่คัดลอกมาจาก "
+                "https://celestrak.org/NORAD/elements/gp.php?NAME=" + (sat_search or "ISS") +
+                "&FORMAT=tle ด้วยเบราว์เซอร์แทนได้เลย"
+            )
         elif len(candidates) == 1:
             tle_name, tle_line1, tle_line2 = candidates[0]
             st.success(f"พบข้อมูล TLE ล่าสุด: {tle_name}")
