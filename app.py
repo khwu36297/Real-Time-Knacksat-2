@@ -54,6 +54,15 @@ THAI_MONTHS = [
 CELESTRAK_HOSTS = ["https://celestrak.org", "https://celestrak.com"]
 
 
+def _fetch_one_host(host: str, query: str, headers: dict, timeout: float):
+    """ยิง request ไปยัง host เดียว คืน raw text ถ้าสำเร็จ (status 200), else raise"""
+    url = f"{host}/NORAD/elements/gp.php?NAME={query}&FORMAT=tle"
+    response = requests.get(url, headers=headers, timeout=timeout)
+    if response.status_code != 200:
+        raise ConnectionError(f"{host} ตอบกลับสถานะ HTTP {response.status_code}")
+    return response.text
+
+
 @st.cache_data(ttl=3600)
 def fetch_tle_candidates(query: str):
     """ดึงค่า TLE จาก CelesTrak API — คืนเป็น list เพราะการค้นหาบางชื่ออาจได้หลายดวง
@@ -61,44 +70,50 @@ def fetch_tle_candidates(query: str):
     หมายเหตุสำคัญ: ฟังก์ชันนี้ต้อง 'raise Exception' เมื่อดึงข้อมูลไม่สำเร็จ (ไม่ return
     error กลับไปแบบปกติ) เพราะ @st.cache_data ของ Streamlit จะไม่ cache ผลลัพธ์ตอนที่ฟังก์ชัน
     raise exception ออกมา — ถ้า return ค่า error เป็น tuple ตามปกติ Streamlit จะเก็บ (cache)
-    ผลลัพธ์ error นั้นไว้เต็ม ttl (1 ชม.) ทำให้ต่อให้เน็ต/CelesTrak กลับมาใช้ได้แล้ว ผู้ใช้ก็ยัง
-    เจอ error เดิมค้างอยู่จนครบชั่วโมง อันนี้แก้บั๊กเดิมด้วย
+    ผลลัพธ์ error นั้นไว้เต็ม ttl (1 ชม.)
 
-    ลอง celestrak.org ก่อน ถ้าไทม์เอาต์/ต่อไม่ติดค่อย fallback ไป celestrak.com (mirror เดิม)
-    และลองซ้ำ host ละ 2 ครั้ง กันปัญหาการเชื่อมต่อสะดุดแว้บเดียว
+    ยิง request ไปทั้ง celestrak.org และ celestrak.com 'พร้อมกัน' (ไม่ใช่ลองทีละอันแบบ retry
+    ต่อเนื่อง) แล้วใช้ผลลัพธ์จาก host ที่ตอบสำเร็จก่อน — เวลารอจึงถูกจำกัดด้วย host ที่ไวที่สุด
+    ไม่ใช่ผลรวมของทุก host+retry เหมือนเดิม (ของเดิมกรณีเลวร้ายสุดรอได้ถึง ~60 วิ ตอนนี้ไม่เกิน
+    ~timeout วิ)
     """
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SatelliteCommandDelayCalc/1.0)"}
+    timeout = 8.0
     last_error = None
 
-    for host in CELESTRAK_HOSTS:
-        url = f"{host}/NORAD/elements/gp.php?NAME={query}&FORMAT=tle"
-        for attempt in range(2):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(CELESTRAK_HOSTS)) as executor:
+        futures = {
+            executor.submit(_fetch_one_host, host, query, headers, timeout): host
+            for host in CELESTRAK_HOSTS
+        }
+        raw_text = None
+        for future in concurrent.futures.as_completed(futures, timeout=timeout + 3):
+            host = futures[future]
             try:
-                response = requests.get(url, headers=headers, timeout=15)
+                raw_text = future.result()
+                break  # host แรกที่ตอบสำเร็จ ใช้อันนี้เลย ไม่ต้องรอที่เหลือ
             except Exception as e:
-                last_error = f"เชื่อมต่อ {host} ไม่สำเร็จ: {e}"
+                last_error = f"{host}: {e}"
                 continue
 
-            if response.status_code != 200:
-                last_error = f"{host} ตอบกลับสถานะ HTTP {response.status_code}"
-                continue
+    if raw_text is None:
+        raise ConnectionError(last_error or "เชื่อมต่อ CelesTrak ไม่สำเร็จ (ไม่ทราบสาเหตุ)")
 
-            lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
-            if len(lines) < 3:
-                raise ValueError("ไม่พบข้อมูลดาวเทียมที่ตรงกับคำค้นหา")
+    lines = [l.strip() for l in raw_text.strip().splitlines() if l.strip()]
+    if len(lines) < 3:
+        raise ValueError("ไม่พบข้อมูลดาวเทียมที่ตรงกับคำค้นหา")
 
-            candidates = []
-            for i in range(0, len(lines) - 2, 3):
-                name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
-                if l1.startswith("1 ") and l2.startswith("2 "):
-                    candidates.append((name, l1, l2))
+    candidates = []
+    for i in range(0, len(lines) - 2, 3):
+        name, l1, l2 = lines[i], lines[i + 1], lines[i + 2]
+        if l1.startswith("1 ") and l2.startswith("2 "):
+            candidates.append((name, l1, l2))
 
-            if not candidates:
-                raise ValueError("รูปแบบข้อมูลที่ได้รับไม่ถูกต้อง (ไม่พบบรรทัด TLE ที่สมบูรณ์)")
+    if not candidates:
+        raise ValueError("รูปแบบข้อมูลที่ได้รับไม่ถูกต้อง (ไม่พบบรรทัด TLE ที่สมบูรณ์)")
 
-            return candidates, None
+    return candidates, None
 
-    raise ConnectionError(last_error or "เชื่อมต่อ CelesTrak ไม่สำเร็จ (ไม่ทราบสาเหตุ)")
 
 
 
