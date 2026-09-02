@@ -1,0 +1,8 @@
+streamlit>=1.37
+pandas
+numpy
+skyfield
+requests
+folium
+streamlit-folium
+plotly
